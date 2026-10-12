@@ -17,6 +17,8 @@ No cloud, no third-party service — everything happens on your local network.
 - Full BMS configuration snapshot every 60 min:
   cell voltage thresholds, current limits, temperature protections,
   balancing parameters
+- Undocumented BMS settings stored as raw values, clearly marked as
+  unconfirmed
 - Robust parser that handles Felicity's single-quoted, multi-block JSON
 - All data stored under `0_userdata.0.Felicity.*`
 
@@ -54,7 +56,7 @@ On first run the script creates all datapoints under
 `0_userdata.0.Felicity.*` and starts polling. Expected log output:
 
 ```
-Felicity script: startup
+Felicity script v1.0.0: startup
 Creating states under 0_userdata.0.Felicity.* ...
 States ready.
 First runtime poll OK: SOC=66%, V=54.4V, I=30.7A, P=1670W
@@ -162,6 +164,10 @@ Not every firmware exposes every level — missing ones simply stay empty.
 
 Plus MOSFET / heatsink temperature: `mosfet_temp_protect`, `mosfet_temp_alarm`.
 
+All values in °C. Note that the BMS reports configuration temperatures as
+plain °C, whereas the live temperatures (`temp1`, `temp2`) arrive in
+tenths of a degree and are divided by 10.
+
 ### Configuration — balancing
 
 | State | Unit | Description |
@@ -188,6 +194,49 @@ Plus MOSFET / heatsink temperature: `mosfet_temp_protect`, `mosfet_temp_alarm`.
 | `last_meta_update` | ISO timestamp of the last meta poll |
 | `raw_response` | Last raw payload from the battery (troubleshooting) |
 
+### Unconfirmed settings — `settings_raw.*`
+
+The BMS reports a number of settings keys whose meaning is not documented
+anywhere. Rather than guessing silently, the script stores them **unscaled**
+under `0_userdata.0.Felicity.settings_raw.<original key>`. No units are set,
+because none is confirmed.
+
+Where a plausible interpretation exists, the datapoint name carries it with a
+trailing **"?"**. These interpretations are educated guesses derived from the
+observed values and from the behaviour of comparable BMS (in particular
+Pylontech, whose CAN/RS485 protocol Felicity batteries emulate towards the
+inverter). **They are not confirmed by Felicity.**
+
+| Key | Value seen¹ | Interpretation |
+|---|---|---|
+| `iExTime` | 1440 | Idle time until sleep? (min) — 1440 min = 24 h; Pylontech has a comparable idle-to-sleep timer |
+| `fRstCnt` | 10 | Max. number of automatic fault recoveries? |
+| `fClrTi` | 60 | Fault clear delay? (s) |
+| `mRtnEn` | 0 | Manual reset required after fault? |
+| `bLigEn` | 0 | LED indicator enable? |
+| `wSlNum` | 0 | Number of slaves? (parallel packs) |
+| `wMlAdd` | 0 | Master/slave address? (parallel packs) |
+| `wMlRes` | 0 | Unknown, possibly parallel-pack related |
+| `sExTime` | 5 | Unknown (standby time?), unit unclear |
+| `cDDep` | 31 | Unknown — untypical as a SOC limit, possibly a bitmask (0x1F) |
+| `wHMHt` | 0 | Unknown (heater?) |
+| `bWirMo` | 0 | Unknown (communication mode?) |
+| `fRecEn` | 0 | Unknown (fault recovery or fault record enable?) |
+| `cTempC` | 0 | Unknown |
+| `CommVer` | 1 | Protocol version |
+| `DevSN` | — | Device serial, same as `serial` |
+| `modID` | 1 | Module ID |
+| `index` | 2 | Response block index? |
+| `Type` | 112 | Battery type code |
+
+¹ LUX-E-48100LG03, single pack. Values on other models or firmware versions
+may differ.
+
+**Help wanted:** If you can confirm a meaning — for example by changing a
+parameter in the manufacturer's app and watching which key changes — please
+open an issue or pull request. Please do not experiment with protection
+parameters for this purpose.
+
 ## Protocol
 
 The script sends three commands over raw TCP:
@@ -205,14 +254,22 @@ characters and merges blocks before parsing.
 ## Adding Unknown Settings Keys
 
 Firmware revisions expose different sets of `settings` keys. If your BMS
-returns a key that isn't mapped yet, it shows up in the log at `debug`
-level:
+returns a key that is neither mapped nor listed in `RAW_SETTINGS`, it shows
+up in the log at `info` level together with its value:
 
 ```
-Unmapped settings keys: someKey, anotherKey
+Unmapped settings: someKey=42, anotherKey=0
 ```
 
-Extending the mapping takes two edits:
+**Meaning unknown:** add the key to `RAW_SETTINGS` so its raw value is
+stored under `settings_raw.*`:
+
+```javascript
+['someKey', 'someKey – unknown', 'number'],
+```
+
+**Meaning confirmed:** promote it to a proper datapoint. This takes two
+edits (and removing the entry from `RAW_SETTINGS`, if present):
 
 1. **`STATES_SETTINGS`** — add a datapoint definition
    ```javascript
