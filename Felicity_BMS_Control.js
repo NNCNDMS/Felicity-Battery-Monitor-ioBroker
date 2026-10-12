@@ -2,6 +2,9 @@
  * Felicity Battery (TCP) Integration for ioBroker
  * ================================================
  *
+ * Version: 1.0.0
+ * Date:    2026-10-12
+ *
  * Reads telemetry, firmware info and configuration parameters from Felicity
  * FLA48200 and compatible batteries via an unofficial local TCP API on
  * port 53970.
@@ -31,6 +34,15 @@
  *   HB      protection reset ("Back")
  *   Lo/L2/LA/LAB/LB   analogous on the low side
  *
+ * Unit note:
+ *   - Runtime temperatures (BTemp) arrive in deci-°C and are divided by 10.
+ *   - Configuration temperatures ('dev set infor') arrive in plain °C.
+ *
+ * Unconfirmed settings:
+ *   Settings keys whose meaning is not documented are stored unscaled under
+ *   0_userdata.0.Felicity.settings_raw.<original key>. Interpretations in the
+ *   state names are marked with "?" and are educated guesses only.
+ *
  * Disclaimer:
  *   The TCP API used here was discovered by traffic analysis and is not
  *   an officially documented interface. Use at your own risk.
@@ -38,15 +50,18 @@
 
 const net = require('net');
 
+const SCRIPT_VERSION = '1.0.0';
+
 // ---------- CONFIGURATION ----------
-const HOST = 'xxx.xxx.xxx.xxx';       // IP of the battery WiFi module
+const HOST = '192.168.178.119';       // IP of the battery WiFi module
 const PORT = 53970;
 const POLL_RUNTIME_MS = 30_000;       // runtime telemetry every 30 s
 const POLL_META_MS = 60 * 60_000;     // basic info + settings every 60 min
 const STATE_PREFIX = '0_userdata.0.Felicity';
+const RAW_PREFIX = 'settings_raw';    // sub-folder for unconfirmed settings
 const TIMEOUT_MS = 5000;
 
-log('Felicity script: startup', 'info');
+log(`Felicity script v${SCRIPT_VERSION}: startup`, 'info');
 
 // ---------- Runtime & meta state definitions ----------
 // [id, display name, unit, role, type]
@@ -142,11 +157,38 @@ const STATES_SETTINGS = [
     ['balance_delta_trigger',       'Balance Delta Trigger',             'V',  'value.voltage',       'number'],
 ];
 
+// Unconfirmed settings, stored unscaled under settings_raw.<key>.
+// [original key, display name, type]
+// Names ending in "?" are guesses based on observed values and on the
+// behaviour of comparable BMS (e.g. Pylontech), NOT on documentation.
+// Units are deliberately left empty because none of them is confirmed.
+const RAW_SETTINGS = [
+    ['CommVer',  'CommVer – protocol version',                      'number'],
+    ['DevSN',    'DevSN – device serial (same as serial)',          'string'],
+    ['modID',    'modID – module ID',                               'number'],
+    ['index',    'index – response block index?',                   'number'],
+    ['Type',     'Type – battery type code',                        'number'],
+    ['wHMHt',    'wHMHt – unknown (heater?)',                       'number'],
+    ['wSlNum',   'wSlNum – number of slaves? (parallel packs)',     'number'],
+    ['wMlAdd',   'wMlAdd – master/slave address? (parallel packs)', 'number'],
+    ['wMlRes',   'wMlRes – unknown (parallel packs?)',              'number'],
+    ['cDDep',    'cDDep – unknown',                                 'number'],
+    ['cTempC',   'cTempC – unknown',                                'number'],
+    ['fRstCnt',  'fRstCnt – max. automatic fault recoveries?',      'number'],
+    ['fClrTi',   'fClrTi – fault clear delay? (s)',                 'number'],
+    ['iExTime',  'iExTime – idle time until sleep? (min)',          'number'],
+    ['sExTime',  'sExTime – unknown (standby time?)',               'number'],
+    ['bWirMo',   'bWirMo – unknown (communication mode?)',          'number'],
+    ['bLigEn',   'bLigEn – LED indicator enable?',                  'number'],
+    ['mRtnEn',   'mRtnEn – manual reset required after fault?',     'number'],
+    ['fRecEn',   'fRecEn – unknown (fault recovery/record enable?)','number'],
+];
+
 // Felicity-key -> [state_id, scale function]
 // Scale functions convert the raw integer to display units.
 const V = (v) => +(v / 1000).toFixed(3);   // mV -> V
 const A = (v) => +(v / 10).toFixed(1);     // dA -> A
-const T = (v) => +(v / 10).toFixed(1);     // deci-°C -> °C
+const T = (v) => +(v / 1).toFixed(1);      // config temperatures are already °C (no division)
 const B = (v) => Boolean(v);
 const I = (v) => v;
 
@@ -207,6 +249,9 @@ const SETTINGS_MAP = {
     balVErr:  ['balance_delta_trigger',       V],
 };
 
+// Lookup of known raw keys for quick membership tests
+const RAW_KEYS = new Set(RAW_SETTINGS.map(([key]) => key));
+
 // Two-digit cell index helper: 1 -> "01", 16 -> "16"
 function pad2(n) { return String(n).padStart(2, '0'); }
 
@@ -251,6 +296,11 @@ async function ensureAllStates() {
     }
     for (const [id, name, unit, role, type] of STATES_SETTINGS) {
         await ensureState(id, name, unit, role, type);
+    }
+    // Unconfirmed settings, raw values under settings_raw.*
+    for (const [key, name, type] of RAW_SETTINGS) {
+        const role = type === 'string' ? 'text' : 'value';
+        await ensureState(`${RAW_PREFIX}.${key}`, name, '', role, type);
     }
     // Cell voltages cell_01_v ... cell_16_v
     for (let i = 1; i <= 16; i++) {
@@ -392,7 +442,7 @@ async function pollRuntime() {
         else if (current < -0.05) direction = 'discharging';
         await setVal('direction', direction);
 
-        // Temperatures (deci-degrees Celsius -> °C)
+        // Runtime temperatures (deci-°C -> °C)
         const t1 = d.BTemp?.[0]?.[0];
         const t2 = d.BTemp?.[0]?.[1];
         if (t1 != null) await setVal('temp1', +(t1 / 10).toFixed(1));
@@ -481,10 +531,17 @@ async function pollMeta() {
             }
         }
 
-        // Log any keys we don't yet know about so people can extend the map
-        const unknown = Object.keys(s).filter(k => !(k in SETTINGS_MAP));
+        // Store unconfirmed settings unscaled under settings_raw.*
+        for (const [key] of RAW_SETTINGS) {
+            const raw = s[key];
+            if (raw === undefined || raw === null) continue;
+            await setVal(`${RAW_PREFIX}.${key}`, raw);
+        }
+
+        // Keys that are in neither map (e.g. from other firmware versions)
+        const unknown = Object.keys(s).filter(k => !(k in SETTINGS_MAP) && !RAW_KEYS.has(k));
         if (unknown.length) {
-            log(`Unmapped settings keys: ${unknown.join(', ')}`, 'debug');
+            log(`Unmapped settings: ${unknown.map(k => `${k}=${JSON.stringify(s[k])}`).join(', ')}`, 'info');
         }
     } catch (err) {
         log(`Settings error: ${err.message}`, 'warn');
